@@ -1,15 +1,29 @@
 @import "tailwindcss";
 
 @theme {
-  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif,
-    "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";
+  --color-omni-bg: #0f172a; /* slate-900 */
+  --color-omni-panel: rgba(30, 41, 59, 0.7); /* slate-800 with opacity for glassmorphism */
+  --color-omni-panel-border: rgba(255, 255, 255, 0.1);
+  --color-omni-accent: #3b82f6; /* blue-500 */
+  --color-omni-accent-hover: #2563eb; /* blue-600 */
+  --color-omni-text: #f8fafc; /* slate-50 */
+  --color-omni-muted: #94a3b8; /* slate-400 */
 }
 
-html,
-body {
-  @apply bg-white dark:bg-gray-950;
+@layer base {
+  body {
+    background-color: var(--color-omni-bg);
+    color: var(--color-omni-text);
+  }
+}
 
-  @media (prefers-color-scheme: dark) {
-    color-scheme: dark;
+/* Glassmorphism utility */
+@layer utilities {
+  .glass-panel {
+    background-color: var(--color-omni-panel);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    border: 1px solid var(--color-omni-panel-border);
+    box-shadow: 0 4px 30px rgba(0, 0, 0, 0.1);
   }
 }
