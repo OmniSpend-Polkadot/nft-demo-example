@@ -4,11 +4,11 @@ import { BrowserProvider, JsonRpcSigner, ethers } from "ethers";
 // EIP-712 Domain and Types based on our smart contracts
 export const PERMIT2_ADDRESS = "0x000000000022D473030F116dDEE9F6B43aC78BA3";
 
-const DOMAIN = {
+const getDomain = (chainId: number) => ({
     name: "Permit2",
-    chainId: 11155420, // Example: OP Sepolia
+    chainId: chainId,
     verifyingContract: PERMIT2_ADDRESS,
-};
+});
 
 // Based on OriginSettler GASLESS_ORDER_WITNESS_TYPES
 const TYPES = {
@@ -60,14 +60,19 @@ export function useWeb3() {
     }, []);
 
     const connect = async () => {
-        if (!provider) {
-            alert("Please install MetaMask!");
+        if (typeof window === "undefined" || !window.ethereum) {
+            alert("Please install MetaMask or a compatible Web3 wallet!");
             return;
         }
         try {
             setIsConnecting(true);
-            await provider.send("eth_requestAccounts", []);
-            const newSigner = await provider.getSigner();
+            const currentProvider = provider || new BrowserProvider(window.ethereum as any);
+            if (!provider) {
+                setProvider(currentProvider);
+            }
+
+            await currentProvider.send("eth_requestAccounts", []);
+            const newSigner = await currentProvider.getSigner();
             setSigner(newSigner);
             setAddress(await newSigner.getAddress());
         } catch (error) {
@@ -87,9 +92,49 @@ export function useWeb3() {
         solverFee: bigint,
         exclusiveSolver: string
     ) => {
-        if (!signer || !address) throw new Error("Wallet not connected");
+        if (!window.ethereum) throw new Error("Wallet not connected");
 
-        // Mock order generation for demo purposes
+        // Re-initialize provider and signer locally to avoid "network changed" errors
+        // when looping across different chains.
+        const localProvider = new BrowserProvider(window.ethereum as any);
+        const localSigner = await localProvider.getSigner();
+        const localAddress = await localSigner.getAddress();
+
+        const network = await localProvider.getNetwork();
+        const activeChainId = Number(network.chainId);
+
+        // 1. Check and request ERC-20 Approval for Permit2
+        const ERC20_ABI = [
+            "function allowance(address owner, address spender) view returns (uint256)",
+            "function approve(address spender, uint256 amount) returns (bool)",
+            "function balanceOf(address account) view returns (uint256)"
+        ];
+        const tokenContract = new ethers.Contract(token, ERC20_ABI, localSigner);
+
+        try {
+            // Check Balance first!
+            const balance = await tokenContract.balanceOf(localAddress);
+            if (balance < amountIn) {
+                const required = ethers.formatUnits(amountIn, 6);
+                const current = ethers.formatUnits(balance, 6);
+                throw new Error(`Insufficient MockUSDC balance. You have ${current} USDC, but need ${required} USDC.`);
+            }
+
+            // Check Allowance
+            const currentAllowance = await tokenContract.allowance(localAddress, PERMIT2_ADDRESS);
+            if (currentAllowance < amountIn) {
+                console.log("Requesting Permit2 approval...");
+                // Request max approval for better UX on subsequent trades
+                const approveTx = await tokenContract.approve(PERMIT2_ADDRESS, ethers.MaxUint256);
+                await approveTx.wait();
+                console.log("Permit2 approved successfully.");
+            }
+        } catch (err: any) {
+            console.error("ERC-20 Approval failed:", err);
+            throw new Error(`Permit2 Approval failed: ${err.message}`);
+        }
+
+        // 2. Generate Order and Sign Permit2 Intent
         const nonce = BigInt(Math.floor(Math.random() * 1000000));
         const openDeadline = Math.floor(Date.now() / 1000) + 3600; // +1 hour
         const fillDeadline = Math.floor(Date.now() / 1000) + 7200; // +2 hours
@@ -109,9 +154,9 @@ export function useWeb3() {
 
         const order = {
             originSettler,
-            user: address,
+            user: localAddress,
             nonce,
-            originChainId: 11155420, // OP Sepolia
+            originChainId: activeChainId,
             openDeadline,
             fillDeadline,
             orderDataType: ethers.ZeroHash,
@@ -128,15 +173,39 @@ export function useWeb3() {
         };
 
         try {
-            const signature = await signer.signTypedData(DOMAIN, TYPES, message);
+            const signature = await localSigner.signTypedData(getDomain(activeChainId), TYPES, message);
             return { signature, order, message };
         } catch (err) {
             console.error("Signature failed:", err);
             throw err;
         }
-    }, [signer, address]);
+    }, []);
 
-    return { address, isConnecting, connect, signOrder };
+    // Utility to switch network
+    const switchNetwork = async (targetChainId: number) => {
+        if (!window.ethereum) throw new Error("No wallet");
+        const hexChainId = "0x" + targetChainId.toString(16);
+        try {
+            const tempProvider = new BrowserProvider(window.ethereum as any);
+            await tempProvider.send("wallet_switchEthereumChain", [{ chainId: hexChainId }]);
+            // wait a bit for it to take effect
+            await new Promise((r) => setTimeout(r, 1000));
+        } catch (err: any) {
+            throw new Error(`Failed to switch to chain ${targetChainId}. Error: ${err.message}`);
+        }
+    };
+
+    // Utility to fetch balance without needing to be connected to that chain
+    const fetchBalanceAsync = async (chainId: number, tokenAddress: string, userAddress: string) => {
+        const rpcUrl = chainId === 11155420 ? "https://sepolia.optimism.io" : "https://sepolia.base.org";
+        const tempProvider = new ethers.JsonRpcProvider(rpcUrl);
+        const ERC20_ABI = ["function balanceOf(address account) view returns (uint256)"];
+        const contract = new ethers.Contract(tokenAddress, ERC20_ABI, tempProvider);
+        const balance = await contract.balanceOf(userAddress);
+        return ethers.formatUnits(balance, 6);
+    };
+
+    return { address, isConnecting, connect, signOrder, switchNetwork, fetchBalanceAsync };
 }
 
 // Add ethereum to window type

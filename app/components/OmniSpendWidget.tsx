@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { ArrowRight, Loader2, CheckCircle2, AlertCircle } from "lucide-react";
 import { useAuctioneer } from "../hooks/useAuctioneer";
@@ -11,35 +11,69 @@ const ORIGIN_SETTLER_OP = "0xd2839302132984bE900Fbd769F043721A7d8Bb7C";
 const ORIGIN_SETTLER_BASE = "0xDc38039f0FB91BF79b4AF1cD83220D1f65b50AaC";
 const USDC_OP = "0x5fd84259d66Cd46123540766Be93DFE6D43130D7";
 const USDC_BASE = "0x036CbD53842c5426634e7929541eC2318f3dCF7e";
+const USDC_PASEO = "0x9Dd96D4BC333A4A3Bbe1238C03f28Bf4a9c8aCAb";
 const DEST_CHAIN_ID = 420420417; // Polkadot Paseo
-const MOCK_NFT_TARGET = "0x8496f66335596483d65e9FC9E03F70B21Ee1C6ba";
+const MOCK_NFT_TARGET = "0xd5abE7C17F2E5B7840A0D9DE52dC1A85e2111230";
 
 type WidgetState = "INPUT" | "REQUESTING_QUOTE" | "QUOTE_REVIEW" | "SIGNING" | "SUCCESS";
 
+interface LegState {
+    chain: string;
+    chainId: number;
+    amount: string;
+    enabled: boolean;
+}
+
 export function OmniSpendWidget() {
-    const { address, connect, isConnecting, signOrder } = useWeb3();
+    const { address, connect, isConnecting, signOrder, switchNetwork, fetchBalanceAsync } = useWeb3();
     const { requestQuote, submitSignature } = useAuctioneer();
 
     const [uiState, setUiState] = useState<WidgetState>("INPUT");
     const [auctionResult, setAuctionResult] = useState<AuctionResult | null>(null);
-    const [totalOutput] = useState("5.0"); // Fixed for demo: 5 USDC NFT
+    const [totalOutput] = useState("4.0"); // Fixed for demo: 4 USDC NFT
+    const [signingProgress, setSigningProgress] = useState("");
 
-    // Hardcoded legs for demo: user paying from OP and Base
-    const legs = [
-        { chain: "OP Sepolia", chainId: 11155420, amount: "2.0" },
-        { chain: "Base Sepolia", chainId: 84532, amount: "3.0" }
-    ];
+    const [opBalance, setOpBalance] = useState("0.0");
+    const [baseBalance, setBaseBalance] = useState("0.0");
 
-    // React Query Mutation to fetch RFQ Quote
+    const [legs, setLegs] = useState<LegState[]>([
+        { chain: "OP Sepolia", chainId: 11155420, amount: "1.5", enabled: true },
+        { chain: "Base Sepolia", chainId: 84532, amount: "2.5", enabled: true }
+    ]);
+
+    // Fetch balances when address changes
+    useEffect(() => {
+        if (address) {
+            fetchBalanceAsync(11155420, USDC_OP, address).then(setOpBalance).catch(console.error);
+            fetchBalanceAsync(84532, USDC_BASE, address).then(setBaseBalance).catch(console.error);
+        }
+    }, [address, fetchBalanceAsync, uiState]); // Refetch on state change (e.g. after success)
+
+    // Calculate sum of active legs
+    const currentTotal = legs.filter(l => l.enabled).reduce((sum, leg) => sum + (parseFloat(leg.amount) || 0), 0);
+    const isValidInput = Math.abs(currentTotal - parseFloat(totalOutput)) < 0.01 && legs.some(l => l.enabled);
+
     const quoteMutation = useMutation({
-        mutationFn: () => requestQuote(
-            address || "0xDEMO",
-            legs,
-            { chain: "Polkadot Paseo", chainId: DEST_CHAIN_ID },
-            totalOutput,
-            MOCK_NFT_TARGET,
-            "0x" // Empty calldata for MockNFT
-        ),
+        mutationFn: () => {
+            const activeLegs = legs.filter(l => l.enabled).map(l => ({
+                chain: l.chain,
+                chainId: l.chainId,
+                amount: l.amount
+            }));
+
+            // Generate calldata for the NFT Mint
+            const iface = new ethers.Interface(["function buyItem(address receiver)"]);
+            const callData = address ? iface.encodeFunctionData("buyItem", [address]) : "0x";
+
+            return requestQuote(
+                address || "0xDEMO",
+                activeLegs,
+                { chain: "Polkadot Paseo", chainId: DEST_CHAIN_ID },
+                totalOutput,
+                MOCK_NFT_TARGET,
+                callData
+            );
+        },
         onMutate: () => setUiState("REQUESTING_QUOTE"),
         onSuccess: (data) => {
             setAuctionResult(data);
@@ -52,37 +86,74 @@ export function OmniSpendWidget() {
         }
     });
 
-    // React Query Mutation for Execution
+    // React Query Mutation for Execution (MULTIPLE SIGNATURES)
     const executeMutation = useMutation({
         mutationFn: async () => {
             if (!auctionResult?.winner) throw new Error("No winning quote");
+            if (!address) throw new Error("User disconnected");
 
-            // For demo, we sign the OP Sepolia leg
-            const amountInWei = ethers.parseUnits(legs[0].amount, 6); // 2.0 USDC
-            const amountOutWei = ethers.parseUnits("2.5", 6); // Just proportional output for mock
-            const solverFeeWei = ethers.parseUnits(auctionResult.winner.fee, 6);
+            const activeLegs = legs.filter(l => l.enabled);
+            const signedPayloads = [];
 
-            const signedData = await signOrder(
-                ORIGIN_SETTLER_OP,
-                USDC_OP,
-                amountInWei,
-                BigInt(DEST_CHAIN_ID),
-                amountOutWei,
-                MOCK_NFT_TARGET,
-                solverFeeWei,
-                auctionResult.winner.solverAddress
-            );
+            // Proportion mapping for fees
+            // We split the solver fee proportionally across the active legs.
+            const totalFeeNumber = parseFloat(auctionResult.winner.fee);
 
-            return submitSignature(auctionResult.requestId, auctionResult.winner.solverAddress, signedData);
+            for (let i = 0; i < activeLegs.length; i++) {
+                const leg = activeLegs[i];
+
+                setSigningProgress(`Switching to ${leg.chain}...`);
+                await switchNetwork(leg.chainId);
+
+                const targetOriginSettler = leg.chainId === 84532 ? ORIGIN_SETTLER_BASE : ORIGIN_SETTLER_OP;
+                const targetUsdc = leg.chainId === 84532 ? USDC_BASE : USDC_OP;
+
+                const legAmountNumber = parseFloat(leg.amount);
+                const feeShare = (legAmountNumber / currentTotal) * totalFeeNumber;
+
+                const amountInWei = ethers.parseUnits(leg.amount, 6);
+                const amountOutWei = ethers.parseUnits(leg.amount, 6); // Passing proportionally
+                const solverFeeWei = ethers.parseUnits(feeShare.toFixed(6), 6);
+
+                setSigningProgress(`Waiting for Signature on ${leg.chain} (${i + 1}/${activeLegs.length})...`);
+
+                const signedData = await signOrder(
+                    targetOriginSettler,
+                    targetUsdc,
+                    amountInWei, // Check approval and sign
+                    BigInt(DEST_CHAIN_ID),
+                    amountOutWei,
+                    MOCK_NFT_TARGET,
+                    solverFeeWei,
+                    auctionResult.winner.solverAddress
+                );
+
+                signedPayloads.push(signedData);
+            }
+
+            setSigningProgress("Submitting aggregated signatures...");
+            return submitSignature(auctionResult.requestId, auctionResult.winner.solverAddress, {
+                isBatch: true,
+                payloads: signedPayloads
+            });
         },
-        onMutate: () => setUiState("SIGNING"),
+        onMutate: () => {
+            setUiState("SIGNING");
+            setSigningProgress("Preparing transactions...");
+        },
         onSuccess: () => setUiState("SUCCESS"),
-        onError: (err) => {
+        onError: (err: any) => {
             console.error(err);
             setUiState("QUOTE_REVIEW");
-            alert("Signature rejected or execution failed.");
+            alert(err.message || "Signature rejected or execution failed.");
         }
     });
+
+    const handleLegChange = (index: number, field: string, value: any) => {
+        const newLegs = [...legs];
+        newLegs[index] = { ...newLegs[index], [field]: value };
+        setLegs(newLegs);
+    };
 
     return (
         <div className="w-full max-w-md mx-auto glass-panel rounded-2xl p-6 shadow-2xl transition-all duration-300">
@@ -113,17 +184,43 @@ export function OmniSpendWidget() {
                 <div className="space-y-6 animate-in fade-in slide-in-from-bottom-2 duration-500">
 
                     <div className="space-y-3">
-                        <p className="text-sm font-medium text-slate-400 uppercase tracking-wider">Pay From</p>
+                        <div className="flex justify-between items-center">
+                            <p className="text-sm font-medium text-slate-400 uppercase tracking-wider">Pay From (Aggregate)</p>
+                            <span className={`text-xs font-mono font-bold px-2 py-0.5 rounded-full ${isValidInput ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'}`}>
+                                Total: {currentTotal.toFixed(2)} / {totalOutput}
+                            </span>
+                        </div>
+
                         {legs.map((leg, i) => (
-                            <div key={i} className="flex justify-between items-center bg-slate-800/50 p-4 rounded-xl border border-slate-700/50">
-                                <div className="flex items-center gap-3">
-                                    <div className={`w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold ${leg.chain.includes('OP') ? 'bg-red-500/20 text-red-500' : 'bg-blue-500/20 text-blue-500'}`}>
-                                        {leg.chain.substring(0, 2)}
+                            <div key={i} className={`flex flex-col bg-slate-800/50 p-4 rounded-xl border transition-colors ${leg.enabled ? 'border-slate-600' : 'border-slate-800 opacity-50'}`}>
+                                <div className="flex justify-between items-center mb-2">
+                                    <div className="flex items-center gap-3">
+                                        <input
+                                            type="checkbox"
+                                            checked={leg.enabled}
+                                            onChange={(e) => handleLegChange(i, 'enabled', e.target.checked)}
+                                            className="w-4 h-4 rounded border-slate-600 bg-slate-700 checked:bg-blue-500"
+                                        />
+                                        <div className={`w-6 h-6 rounded-full flex items-center justify-center text-[10px] font-bold ${leg.chain.includes('OP') ? 'bg-red-500/20 text-red-500' : 'bg-blue-500/20 text-blue-500'}`}>
+                                            {leg.chain.substring(0, 2)}
+                                        </div>
+                                        <span className="font-medium text-slate-200">{leg.chain}</span>
                                     </div>
-                                    <span className="font-medium text-slate-200">{leg.chain}</span>
+                                    <div className="text-xs text-slate-400 font-mono">
+                                        Bal: {leg.chain.includes('OP') ? opBalance : baseBalance} USDC
+                                    </div>
                                 </div>
-                                <div className="text-right">
-                                    <div className="font-mono text-lg text-white">{leg.amount} <span className="text-sm text-slate-400">USDC</span></div>
+                                <div className="flex items-center gap-2 pl-9">
+                                    <input
+                                        type="number"
+                                        value={leg.amount}
+                                        onChange={(e) => handleLegChange(i, 'amount', e.target.value)}
+                                        disabled={!leg.enabled}
+                                        step="0.1"
+                                        min="0"
+                                        className="bg-slate-900 border border-slate-700 text-white text-lg font-mono rounded-lg px-3 py-1.5 w-full focus:outline-none focus:border-blue-500 transition-colors disabled:opacity-50"
+                                    />
+                                    <span className="text-sm text-slate-400 font-mono">USDC</span>
                                 </div>
                             </div>
                         ))}
@@ -155,10 +252,12 @@ export function OmniSpendWidget() {
 
                     <button
                         onClick={() => quoteMutation.mutate()}
-                        disabled={!address}
+                        disabled={!address || !isValidInput}
                         className="w-full mt-6 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white font-bold py-4 rounded-xl transition-all shadow-[0_0_20px_rgba(59,130,246,0.3)] disabled:opacity-50 disabled:cursor-not-allowed"
                     >
-                        {address ? "Get Firm Quote" : "Connect Wallet to Continue"}
+                        {!address ? "Connect Wallet to Continue"
+                            : !isValidInput ? `Amount must equal ${totalOutput}`
+                                : "Get Firm Quote"}
                     </button>
                 </div>
             )}
@@ -219,13 +318,13 @@ export function OmniSpendWidget() {
                         </div>
                         <div className="flex justify-between text-sm">
                             <span className="text-slate-400">Protocol Fee (0.3% origin)</span>
-                            <span className="text-blue-400 font-mono">0.015 USDC</span>
+                            <span className="text-blue-400 font-mono">{((parseFloat(totalOutput) * 3) / 1000).toFixed(3)} USDC</span>
                         </div>
                         <div className="h-px w-full bg-slate-700 my-2"></div>
                         <div className="flex justify-between font-bold text-lg">
-                            <span className="text-slate-200">You Pay</span>
+                            <span className="text-slate-200">Total Deducted</span>
                             <span className="text-white font-mono">
-                                {parseFloat(totalOutput) + (parseFloat(auctionResult.winner?.fee || "0")) + 0.015} USDC
+                                {(parseFloat(totalOutput) + (parseFloat(auctionResult.winner?.fee || "0")) + ((parseFloat(totalOutput) * 3) / 1000)).toFixed(3)} USDC
                             </span>
                         </div>
                     </div>
@@ -241,10 +340,16 @@ export function OmniSpendWidget() {
                         <button
                             onClick={() => executeMutation.mutate()}
                             disabled={!auctionResult.winner || executeMutation.isPending}
-                            className="flex-1 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white font-bold py-4 rounded-xl transition-all shadow-[0_0_20px_rgba(59,130,246,0.3)] disabled:opacity-50 flex items-center justify-center gap-2"
+                            className="flex-1 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white font-bold py-4 rounded-xl transition-all shadow-[0_0_20px_rgba(59,130,246,0.3)] disabled:opacity-50 flex flex-col items-center justify-center"
                         >
                             {executeMutation.isPending ? (
-                                <><Loader2 className="w-5 h-5 animate-spin" /> Signing...</>
+                                <>
+                                    <div className="flex items-center gap-2 mb-1">
+                                        <Loader2 className="w-4 h-4 animate-spin" />
+                                        <span>Executing...</span>
+                                    </div>
+                                    <span className="text-[10px] font-normal opacity-80">{signingProgress}</span>
+                                </>
                             ) : (
                                 "Sign & Pay"
                             )}
@@ -266,11 +371,11 @@ export function OmniSpendWidget() {
                     <div>
                         <h3 className="text-xl font-bold text-white mb-2">Intent Sent to Solver!</h3>
                         <p className="text-slate-400 text-sm max-w-[280px] mx-auto">
-                            Your signature has been forwarded exclusively to the winning solver. They are executing the transaction right now.
+                            Your signatures have been forwarded exclusively to the winning solver. They are executing the legs on each chain right now.
                         </p>
                     </div>
                     <button
-                        onClick={() => setUiState("INPUT")}
+                        onClick={() => { setUiState("INPUT"); setAuctionResult(null); }}
                         className="mt-8 text-blue-400 hover:text-blue-300 text-sm font-medium transition-colors border border-blue-500/30 px-6 py-2 rounded-full"
                     >
                         Start New Payment

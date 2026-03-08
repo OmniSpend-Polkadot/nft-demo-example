@@ -63,10 +63,16 @@ export function useAuctioneer() {
         winnerAddress: string,
         signedPayload: any
     ) => {
+        // Safe stringify handling BigInt
+        const safeStringify = JSON.stringify(
+            { requestId, winnerAddress, signedPayload },
+            (key, value) => typeof value === "bigint" ? value.toString() : value
+        );
+
         const response = await fetch(`${AUCTIONEER_URL}/api/submit-signature`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ requestId, winnerAddress, signedPayload }),
+            body: safeStringify,
         });
 
         if (!response.ok) {
