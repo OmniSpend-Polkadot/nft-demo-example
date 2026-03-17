@@ -1,5 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
-import { io, Socket } from "socket.io-client";
+import { useCallback } from "react";
 
 const AUCTIONEER_URL = "http://localhost:3001";
 
@@ -18,9 +17,6 @@ export interface AuctionResult {
 }
 
 export function useAuctioneer() {
-    const [socket, setSocket] = useState<Socket | null>(null);
-    const [isConnected, setIsConnected] = useState(false);
-
     // Note: the widget acts as an API client, it doesn't need to connect via WebSocket.
     // The solvers connect via WebSocket. The Widget asks for quotes via REST to the Auctioneer,
     // who then broadcasts via WebSocket.
@@ -66,7 +62,7 @@ export function useAuctioneer() {
         // Safe stringify handling BigInt
         const safeStringify = JSON.stringify(
             { requestId, winnerAddress, signedPayload },
-            (key, value) => typeof value === "bigint" ? value.toString() : value
+            (_key, value) => typeof value === "bigint" ? value.toString() : value
         );
 
         const response = await fetch(`${AUCTIONEER_URL}/api/submit-signature`, {
