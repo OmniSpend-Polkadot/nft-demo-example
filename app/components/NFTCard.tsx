@@ -162,8 +162,7 @@ export function NFTCard({ onPaymentSuccess }: NFTCardProps) {
           {/* Info */}
           <div className="space-y-3">
             <div>
-              <h3 className="text-xl font-bold text-white">Genesis Art #{(totalSupply || 0) + 1}</h3>
-              <p className="text-sm text-slate-400">Limited edition generative art</p>
+              <h3 className="text-xl font-bold text-white">Genesis Art Example</h3>
             </div>
 
             <div className="flex items-center justify-between">
@@ -172,10 +171,6 @@ export function NFTCard({ onPaymentSuccess }: NFTCardProps) {
                 <p className="text-2xl font-bold text-white font-mono">
                   {isLoadingPrice ? "..." : nftPrice} <span className="text-sm text-slate-400">USDC</span>
                 </p>
-              </div>
-              <div className="text-right">
-                <p className="text-xs text-slate-500 uppercase tracking-wider">Minted</p>
-                <p className="text-lg font-semibold text-slate-300">{totalSupply} / 100</p>
               </div>
             </div>
 
@@ -219,7 +214,7 @@ export function NFTCard({ onPaymentSuccess }: NFTCardProps) {
           setIsModalOpen(false);
         }}
         nftPrice={nftPrice}
-        nftName={`Genesis Art #${(totalSupply || 0) + 1}`}
+        nftName={`Genesis Art Example`}
         onSuccess={() => {
           onPaymentSuccess?.();
           // Refresh supply

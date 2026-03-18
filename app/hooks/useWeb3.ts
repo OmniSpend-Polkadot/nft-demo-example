@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
-import { BrowserProvider, JsonRpcSigner, ethers } from "ethers";
+import { BrowserProvider, ethers, type JsonRpcSigner } from "ethers";
 
 // EIP-712 Domain and Types based on our smart contracts
 export const PERMIT2_ADDRESS = "0x000000000022D473030F116dDEE9F6B43aC78BA3";
@@ -156,7 +156,7 @@ export function useWeb3() {
             originSettler,
             user: localAddress,
             nonce,
-            originChainId: activeChainId,
+            originChainId: BigInt(activeChainId),
             openDeadline,
             fillDeadline,
             orderDataType: ethers.ZeroHash,

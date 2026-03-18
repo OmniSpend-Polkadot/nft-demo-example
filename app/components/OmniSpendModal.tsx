@@ -1,10 +1,15 @@
 import { useState, useEffect } from "react";
 import { useMutation } from "@tanstack/react-query";
-import { ArrowRight, Loader2, CheckCircle2, AlertCircle, X, Wallet, Check, Clock, Rocket, Shield, Layers, ExternalLink, RefreshCw } from "lucide-react";
-import { useAuctioneer, type AuctionResult } from "../hooks/useAuctioneer";
+import { ArrowRight, Loader2, CheckCircle2, AlertCircle, X, Wallet, Check, Clock, Rocket, Shield, Layers, ExternalLink } from "lucide-react";
+import { OmniSpend, getUSDCAddress, getOriginSettler, type Quote } from "@omnispend/sdk";
 import { useWeb3 } from "../hooks/useWeb3";
-import { useIntentTracker, type IntentStatus, type IntentStep } from "../hooks/useIntentTracker";
+import { useIntentTracker } from "@omnispend/sdk";
+import type { IntentStatus, IntentStep } from "@omnispend/sdk";
 import { ethers } from "ethers";
+
+// SDK configuration
+const AUCTIONEER_URL = "http://localhost:3001";
+const omnispend = new OmniSpend(AUCTIONEER_URL);
 
 // Constants matching our deployed contracts
 const ORIGIN_SETTLER_OP = "0xd2839302132984bE900Fbd769F043721A7d8Bb7C";
@@ -18,7 +23,7 @@ const MOCK_NFT_TARGET = "0xd5abE7C17F2E5B7840A0D9DE52dC1A85e2111230";
 type WidgetState = "INPUT" | "REQUESTING_QUOTE" | "QUOTE_REVIEW" | "SIGNING" | "SUCCESS";
 
 interface LegState {
-  chain: string;
+  name: string;
   chainId: number;
   amount: string;
   enabled: boolean;
@@ -52,9 +57,31 @@ const stepLabels = [
   { icon: Check, label: "Complete", desc: "NFT minted!" },
 ];
 
+// Helper to get explorer URL based on chain name in message
+function getExplorerUrl(message: string): string {
+  if (message.includes("OP Sepolia")) {
+    return "https://sepolia-optimism.etherscan.io/tx";
+  } else if (message.includes("Base")) {
+    return "https://sepolia.basescan.org/tx";
+  } else if (message.includes("Polkadot") || message.includes("Paseo") || message.includes("NFT")) {
+    return "https://polkadot.testnet.routescan.io/tx";
+  }
+  return "https://polkadot.testnet.routescan.io/tx";
+}
+
 // Real Intent Tracker Component - Shows actual solver progress
 function IntentTracker({ currentStep, steps, isConnected }: { currentStep: number; steps: IntentStep[]; isConnected: boolean }) {
   const latestStep = steps[steps.length - 1];
+
+  // Get all steps that correspond to each tracker step (for multiple origin chains)
+  const getStepsForIndex = (index: number): IntentStep[] => {
+    if (index === 0) return steps.filter(s => s.status === "pending");
+    if (index === 1) return steps.filter(s => s.status === "solver_accepted");
+    if (index === 2) return steps.filter(s => s.status.startsWith("origin_"));
+    if (index === 3) return steps.filter(s => s.status === "destination_executing");
+    if (index === 4) return steps.filter(s => s.status === "destination_success" || s.status === "completed");
+    return [];
+  };
 
   return (
     <div className="space-y-2">
@@ -63,6 +90,8 @@ function IntentTracker({ currentStep, steps, isConnected }: { currentStep: numbe
         const isCurrent = index === currentStep;
         const isFailed = currentStep === -1;
         const Icon = step.icon;
+        const stepDataList = getStepsForIndex(index);
+        const txHashes = stepDataList.filter(s => s.txHash).map(s => s.txHash as string);
 
         return (
           <div
@@ -73,7 +102,7 @@ function IntentTracker({ currentStep, steps, isConnected }: { currentStep: numbe
                 : isCompleted ? "bg-green-500/10" : isCurrent ? "bg-blue-500/10" : "bg-slate-800/30"
             }`}
           >
-            <div className={`w-8 h-8 rounded-full flex items-center justify-center ${
+            <div className={`w-8 h-8 rounded-full flex items-center justify-center flex-shrink-0 ${
               isFailed
                 ? "bg-red-500/20 text-red-500"
                 : isCompleted
@@ -97,17 +126,26 @@ function IntentTracker({ currentStep, steps, isConnected }: { currentStep: numbe
                 {step.label}
               </p>
               <p className="text-xs text-slate-400">{step.desc}</p>
-              {/* Show txHash link for completed steps that have txHash */}
-              {isCompleted && latestStep?.txHash && (
-                <a
-                  href={`https://polkadot.testnet.routescan.io/tx/${latestStep.txHash}`}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="text-xs text-green-400 hover:text-green-300 flex items-center gap-1 mt-1"
-                >
-                  <ExternalLink className="w-3 h-3" />
-                  View Transaction
-                </a>
+              {/* Show txHash links for completed steps that have txHashes */}
+              {isCompleted && txHashes.length > 0 && (
+                <div className="flex flex-col gap-1 mt-1">
+                  {txHashes.map((txHash, i) => {
+                    const stepData = stepDataList.find(s => s.txHash === txHash);
+                    const url = getExplorerUrl(stepData?.message || "");
+                    return (
+                      <a
+                        key={i}
+                        href={`${url}/${txHash}`}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="text-xs text-green-400 hover:text-green-300 flex items-center gap-1"
+                      >
+                        <ExternalLink className="w-3 h-3" />
+                        {stepData?.message?.includes("Base") ? "Base" : stepData?.message?.includes("OP") ? "OP" : `Tx ${i + 1}`}
+                      </a>
+                    );
+                  })}
+                </div>
               )}
             </div>
           </div>
@@ -132,11 +170,10 @@ function IntentTracker({ currentStep, steps, isConnected }: { currentStep: numbe
 
 export function OmniSpendModal({ isOpen, onClose, nftPrice, nftName, onSuccess }: OmniSpendModalProps) {
   const { address, connect, isConnecting, signOrder, switchNetwork, fetchBalanceAsync } = useWeb3();
-  const { requestQuote, submitSignature } = useAuctioneer();
-  const { isConnected: trackerConnected, currentIntent, subscribeToIntent } = useIntentTracker(address);
+  const { isConnected: trackerConnected, currentIntent, subscribeToIntent } = useIntentTracker(address, AUCTIONEER_URL);
 
   const [uiState, setUiState] = useState<WidgetState>("INPUT");
-  const [auctionResult, setAuctionResult] = useState<AuctionResult | null>(null);
+  const [auctionResult, setAuctionResult] = useState<Quote | null>(null);
   const [signingProgress, setSigningProgress] = useState("");
   const [requestId, setRequestId] = useState<string>("");
 
@@ -145,8 +182,8 @@ export function OmniSpendModal({ isOpen, onClose, nftPrice, nftName, onSuccess }
 
   // Default legs that sum to the NFT price
   const [legs, setLegs] = useState<LegState[]>([
-    { chain: "OP Sepolia", chainId: 11155420, amount: String(Math.floor(parseFloat(nftPrice) * 0.4 * 100) / 100), enabled: true },
-    { chain: "Base Sepolia", chainId: 84532, amount: String(Math.floor(parseFloat(nftPrice) * 0.6 * 100) / 100), enabled: true }
+    { name: "OP Sepolia", chainId: 11155420, amount: String(Math.floor(parseFloat(nftPrice) * 0.4 * 100) / 100), enabled: true },
+    { name: "Base Sepolia", chainId: 84532, amount: String(Math.floor(parseFloat(nftPrice) * 0.6 * 100) / 100), enabled: true }
   ]);
 
   // Update legs when nftPrice changes
@@ -154,8 +191,8 @@ export function OmniSpendModal({ isOpen, onClose, nftPrice, nftName, onSuccess }
     const price = parseFloat(nftPrice);
     if (price > 0) {
       setLegs([
-        { chain: "OP Sepolia", chainId: 11155420, amount: String(Math.floor(price * 0.4 * 100) / 100), enabled: true },
-        { chain: "Base Sepolia", chainId: 84532, amount: String(Math.floor(price * 0.6 * 100) / 100), enabled: true }
+        { name: "OP Sepolia", chainId: 11155420, amount: String(Math.floor(price * 0.4 * 100) / 100), enabled: true },
+        { name: "Base Sepolia", chainId: 84532, amount: String(Math.floor(price * 0.6 * 100) / 100), enabled: true }
       ]);
     }
   }, [nftPrice]);
@@ -171,8 +208,7 @@ export function OmniSpendModal({ isOpen, onClose, nftPrice, nftName, onSuccess }
   // Subscribe to intent updates when requestId is set
   useEffect(() => {
     if (requestId && uiState === "SUCCESS") {
-      const cleanup = subscribeToIntent(requestId);
-      return cleanup;
+      subscribeToIntent(requestId);
     }
   }, [requestId, uiState, subscribeToIntent]);
 
@@ -192,26 +228,26 @@ export function OmniSpendModal({ isOpen, onClose, nftPrice, nftName, onSuccess }
   const quoteMutation = useMutation({
     mutationFn: () => {
       const activeLegs = legs.filter(l => l.enabled).map(l => ({
-        chain: l.chain,
+        name: l.name,
         chainId: l.chainId,
-        amount: l.amount
+        amount: l.amount,
+        token: l.chainId === 84532 ? USDC_BASE : USDC_OP
       }));
 
       // Generate calldata for the NFT purchase
       const iface = new ethers.Interface(["function buyItem(address receiver)"]);
       const callData = address ? iface.encodeFunctionData("buyItem", [address]) : "0x";
 
-      return requestQuote(
+      return omnispend.requestQuote(
         address || "0xDEMO",
         activeLegs,
-        { chain: "Polkadot Paseo", chainId: DEST_CHAIN_ID },
-        nftPrice,
+        { name: "Polkadot Paseo", chainId: DEST_CHAIN_ID, target: MOCK_NFT_TARGET, callData, outputAmount: nftPrice },
         MOCK_NFT_TARGET,
         callData
       );
     },
     onMutate: () => setUiState("REQUESTING_QUOTE"),
-    onSuccess: (data) => {
+    onSuccess: (data: Quote) => {
       setAuctionResult(data);
       setUiState("QUOTE_REVIEW");
     },
@@ -227,7 +263,12 @@ export function OmniSpendModal({ isOpen, onClose, nftPrice, nftName, onSuccess }
       if (!auctionResult?.winner) throw new Error("No winning quote");
       if (!address) throw new Error("User disconnected");
 
-      const activeLegs = legs.filter(l => l.enabled);
+      const activeLegs = legs.filter(l => l.enabled).map(l => ({
+        name: l.name,
+        chainId: l.chainId,
+        amount: l.amount,
+        token: l.chainId === 84532 ? USDC_BASE : USDC_OP
+      }));
       const signedPayloads = [];
       const totalFeeNumber = parseFloat(auctionResult.winner.fee);
 
@@ -235,8 +276,8 @@ export function OmniSpendModal({ isOpen, onClose, nftPrice, nftName, onSuccess }
         for (let i = 0; i < activeLegs.length; i++) {
           const leg = activeLegs[i];
 
-          console.log(`🔄 Processing leg ${i + 1}/${activeLegs.length}: ${leg.chain}`);
-          setSigningProgress(`Step ${i + 1}/${activeLegs.length}: Switching to ${leg.chain}...`);
+          console.log(`🔄 Processing leg ${i + 1}/${activeLegs.length}: ${leg.name}`);
+          setSigningProgress(`Step ${i + 1}/${activeLegs.length}: Switching to ${leg.name}...`);
 
           await switchNetwork(leg.chainId);
 
@@ -250,11 +291,11 @@ export function OmniSpendModal({ isOpen, onClose, nftPrice, nftName, onSuccess }
           const amountOutWei = ethers.parseUnits(leg.amount, 6);
           const solverFeeWei = ethers.parseUnits(feeShare.toFixed(6), 6);
 
-          setSigningProgress(`Step ${i + 1}/${activeLegs.length}: Checking USDC approval on ${leg.chain}...`);
+          setSigningProgress(`Step ${i + 1}/${activeLegs.length}: Checking USDC approval on ${leg.name}...`);
 
-          setSigningProgress(`Step ${i + 1}/${activeLegs.length}: Please sign on ${leg.chain}...`);
+          setSigningProgress(`Step ${i + 1}/${activeLegs.length}: Please sign on ${leg.name}...`);
 
-          console.log(`✍️ Signing for ${leg.chain}...`);
+          console.log(`✍️ Signing for ${leg.name}...`);
           const signedData = await signOrder(
             targetOriginSettler,
             targetUsdc,
@@ -266,7 +307,7 @@ export function OmniSpendModal({ isOpen, onClose, nftPrice, nftName, onSuccess }
             auctionResult.winner.solverAddress
           );
 
-          console.log(`✅ Signed for ${leg.chain}`);
+          console.log(`✅ Signed for ${leg.name}`);
           signedPayloads.push(signedData);
         }
       } catch (err) {
@@ -281,14 +322,14 @@ export function OmniSpendModal({ isOpen, onClose, nftPrice, nftName, onSuccess }
       const rid = auctionResult.requestId;
       setRequestId(rid);
 
-      return submitSignature(auctionResult.requestId, auctionResult.winner.solverAddress, {
+      return omnispend.submitSignature(auctionResult.requestId, auctionResult.winner.solverAddress, {
         isBatch: true,
         payloads: signedPayloads,
-        nftName,
+      }, {
         user: address,
         legs: activeLegs,
-        destination: { chain: "Polkadot Paseo", chainId: DEST_CHAIN_ID },
-        totalOutputAmount: nftPrice,
+        destination: { name: "Polkadot Paseo", chainId: DEST_CHAIN_ID, target: MOCK_NFT_TARGET, callData: "0x", outputAmount: nftPrice },
+        nftName,
       });
     },
     onMutate: () => {
@@ -412,13 +453,13 @@ export function OmniSpendModal({ isOpen, onClose, nftPrice, nftName, onSuccess }
                             onChange={(e) => handleLegChange(i, 'enabled', e.target.checked)}
                             className="w-4 h-4 rounded border-slate-600 bg-slate-700 checked:bg-blue-500"
                           />
-                          <div className={`w-6 h-6 rounded-full flex items-center justify-center text-[10px] font-bold ${leg.chain.includes('OP') ? 'bg-red-500/20 text-red-500' : 'bg-blue-500/20 text-blue-500'}`}>
-                            {leg.chain.substring(0, 2)}
+                          <div className={`w-6 h-6 rounded-full flex items-center justify-center text-[10px] font-bold ${leg.name.includes('OP') ? 'bg-red-500/20 text-red-500' : 'bg-blue-500/20 text-blue-500'}`}>
+                            {leg.name.substring(0, 2)}
                           </div>
-                          <span className="font-medium text-slate-200">{leg.chain}</span>
+                          <span className="font-medium text-slate-200">{leg.name}</span>
                         </div>
                         <div className="text-xs text-slate-400 font-mono">
-                          Bal: {leg.chain.includes('OP') ? opBalance : baseBalance} USDC
+                          Bal: {leg.name.includes('OP') ? opBalance : baseBalance} USDC
                         </div>
                       </div>
                       <div className="flex items-center gap-2 pl-9">
